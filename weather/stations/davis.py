@@ -400,8 +400,8 @@ class VantagePro(Station):
     """
 
     # device reply commands
-    WAKE_ACK = '\n\r'
-    ACK = '\x06'
+    WAKE_ACK = '\n\r'.encode()
+    ACK = '\x06'.encode()
     ESC = '\x1b'
     OK = '\n\rOK\n\r'
 
@@ -494,7 +494,7 @@ class VantagePro(Station):
         while not awake and i < 3:
             self.port.write("\n".encode())
             ack = self.port.read(len(self.WAKE_ACK))
-            if ack.decode() == self.WAKE_ACK:
+            if ack == self.WAKE_ACK:
                 awake = True
             else:
                 time.sleep(1.2)
@@ -528,7 +528,7 @@ class VantagePro(Station):
             else:
                 ack = self.port.read(len(self.ACK))  # read ACK
                 # log_raw('read', ack)
-                if ack.decode() == self.ACK:
+                if ack == self.ACK:
                     return
         # raise NoDeviceException('Can not access weather station')
 
@@ -557,7 +557,7 @@ class VantagePro(Station):
         crc = struct.pack('>H', crc)  # crc in big-endian format
         self.port.write(tbuf + crc)  # send time stamp + crc
         ack = self.port.read(len(self.ACK))  # read ACK
-        if ack.decode() != self.ACK:
+        if ack != self.ACK:
             return None  # if bad ack, return None
 
         # 3. read pre-amble data
@@ -565,7 +565,7 @@ class VantagePro(Station):
         if not VProCRC.verify(raw):  # check CRC value
             self.port.write(self.ESC)  # if bad, escape and abort
             return
-        self.port.write(self.ACK.encode())  # send ACK
+        self.port.write(self.ACK)  # send ACK
 
         # 4. loop through all page records
         dmp = DmpStruct.unpack(raw)
@@ -577,7 +577,7 @@ class VantagePro(Station):
             if not VProCRC.verify(raw):  # check CRC value
                 self.port.write(self.ESC)  # if bad, escape and abort
                 return
-            self.port.write(self.ACK.encode())  # send ACK
+            self.port.write(self.ACK)  # send ACK
 
             # 6. loop through archive records
             page = DmpPageStruct.unpack(raw)
