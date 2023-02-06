@@ -24,6 +24,7 @@ from ._struct import Struct
 from ..units import *
 from .station import *
 
+import asyncio
 import logging
 import serial
 import struct
@@ -413,18 +414,22 @@ class VantagePro(Station):
             device,
             log_interval=5,
             log_start_date=None,
-            clear=False
+            clear=False,
+            want_archives=True
     ):
         """
         Initialize the serial connection with the console.
-        :param device: /dev/yourConsoleDevice
+        :param device: a "device" object that can do async read/write
         :param log_interval: default 5
         :param log_start_date: the datetime.datetime object representing the
             starting log date. Default None aka "all"
         :param clear: boolean, if true clean all the log in the console.
             Default False.
+        :param want_archives: boolean, if true request and parse old archived
+            entries from weather station. This is like 'clear' but without
+            altering what is stored on the weather station. Default True
         """
-        self.port = serial.Serial(device, BAUD, timeout=READ_DELAY)
+        self.port = device
         # set the logging interval to be downloaded. Default all
         if log_start_date is None:
             self._archive_time = (0, 0)
@@ -435,6 +440,8 @@ class VantagePro(Station):
         if clear:
             self._cmd('CLRLOG')  # prevent getting a full log dump at startup
         self._cmd('SETPER', log_interval, ok=True)
+
+        self.want_archives = want_archives
 
         self.fields = {}
 
@@ -484,20 +491,22 @@ class VantagePro(Station):
 
         return self._ARCHIVE_REV_B
 
-    def _wakeup(self) -> None:
+    async def _wakeup(self) -> None:
         """
         issue wakeup command to device to take out of standby mode.
         """
-        log.info("send: WAKEUP")
-
         awake, i = False, 0
         while not awake and i < 3:
-            self.port.write("\n".encode())
-            ack = self.port.read(len(self.WAKE_ACK))
-            if ack == self.WAKE_ACK:
-                awake = True
-            else:
-                time.sleep(1.2)
+            log.debug("send: WAKEUP")
+            try:
+                await self.port.write("\n".encode())
+                ack = await asyncio.wait_for(
+                        self.port.read(len(self.WAKE_ACK)),
+                        timeout=1.2
+                        )
+                if ack == self.WAKE_ACK:
+                    awake = True
+            except asyncio.exceptions.TimeoutError:
                 i += 1
 
         try:
@@ -507,41 +516,56 @@ class VantagePro(Station):
 
         return None
 
-    def _cmd(self, cmd, *args, **kw) -> None:
+    async def _cmd(self, cmd, *args, **kw) -> None:
         """
         write a single command, with variable number of arguments. after the
         command, the device must return ACK
         """
         ok = kw.setdefault('ok', False)
 
-        self._wakeup()
+        await self._wakeup()
         if args:
             cmd = "%s %s" % (cmd, ' '.join(str(a) for a in args))
         for i in range(3):
-            log.info("send: " + cmd)
-            self.port.write(f"{cmd} \n".encode())
+            log.debug("send: " + cmd)
+            await self.port.write(f"{cmd} \n".encode())
             if ok:
-                ack = self.port.read(len(self.OK))  # read OK
+                log.debug("expecting OK rather than ACK in reponse to cmd")
+                try:
+                    ack = await asyncio.wait_for(
+                            self.port.read(len(self.OK)),  # read OK
+                            timeout=5
+                            )
+                except asyncio.exceptions.TimeoutError:
+                    raise NoDeviceException('Lost connection')
+
                 # log_raw('read', ack)
                 if ack == self.OK:
                     return
             else:
-                ack = self.port.read(len(self.ACK))  # read ACK
+                try:
+                    ack = await asyncio.wait_for(
+                        self.port.read(len(self.ACK)),  # read ACK
+                        timeout=1.2
+                        )
+                except asyncio.exceptions.TimeoutError:
+                    raise NoDeviceException('Lost connection')
+
                 # log_raw('read', ack)
                 if ack == self.ACK:
                     return
         # raise NoDeviceException('Can not access weather station')
 
-    def _loop_cmd(self):
+    async def _loop_cmd(self):
         """
         Reads a raw string containing data read from the device
         provided (in /dev/XXX) format. All reads are non-blocking.
         """
-        self._cmd('LOOP', 1)
-        raw = self.port.read(LoopStruct.size)  # read data
+        await self._cmd('LOOP', 1)
+        raw = await self.port.read(LoopStruct.size)  # read data
         return raw
 
-    def _dmpaft_cmd(self, time_fields):
+    async def _dmpaft_cmd(self, time_fields):
         """
         issue a command to read the archive records after a known time stamp.
         """
@@ -550,22 +574,22 @@ class VantagePro(Station):
         tbuf = struct.pack('2H', *time_fields)
 
         # 1. send 'DMPAFT' cmd
-        self._cmd('DMPAFT')
+        await self._cmd('DMPAFT')
 
         # 2. send time stamp + crc
         crc = VProCRC.get(tbuf)
         crc = struct.pack('>H', crc)  # crc in big-endian format
-        self.port.write(tbuf + crc)  # send time stamp + crc
-        ack = self.port.read(len(self.ACK))  # read ACK
+        await self.port.write(tbuf + crc)  # send time stamp + crc
+        ack = await self.port.read(len(self.ACK))  # read ACK
         if ack != self.ACK:
             return None  # if bad ack, return None
 
         # 3. read pre-amble data
-        raw = self.port.read(DmpStruct.size)
+        raw = await self.port.read(DmpStruct.size)
         if not VProCRC.verify(raw):  # check CRC value
-            self.port.write(self.ESC)  # if bad, escape and abort
+            await self.port.write(self.ESC)  # if bad, escape and abort
             return
-        self.port.write(self.ACK)  # send ACK
+        await self.port.write(self.ACK)  # send ACK
 
         # 4. loop through all page records
         dmp = DmpStruct.unpack(raw)
@@ -573,11 +597,11 @@ class VantagePro(Station):
                  (dmp['Pages'], dmp['Offset']))
         for i in range(dmp['Pages']):
             # 5. read page data
-            raw = self.port.read(DmpPageStruct.size)
+            raw = await self.port.read(DmpPageStruct.size)
             if not VProCRC.verify(raw):  # check CRC value
-                self.port.write(self.ESC)  # if bad, escape and abort
+                await self.port.write(self.ESC)  # if bad, escape and abort
                 return
-            self.port.write(self.ACK)  # send ACK
+            await self.port.write(self.ACK)  # send ACK
 
             # 6. loop through archive records
             page = DmpPageStruct.unpack(raw)
@@ -598,10 +622,10 @@ class VantagePro(Station):
         log.info('read all pages')
         return records
 
-    def _get_loop_fields(self):
+    async def _get_loop_fields(self):
         crc_ok = None
         for i in range(3):
-            raw = self._loop_cmd()  # read raw data
+            raw = await self._loop_cmd()  # read raw data
             crc_ok = VProCRC.verify(raw)
             if crc_ok:
                 break  # exit loop if valid
@@ -612,14 +636,14 @@ class VantagePro(Station):
 
         return LoopStruct.unpack(raw)
 
-    def _get_new_archive_fields(self):
+    async def _get_new_archive_fields(self):
         """
         returns a dictionary of fields from the newest archive record in the
         device. return None when no records are new.
         """
         records = []
         for i in range(3):
-            records = self._dmpaft_cmd(self._archive_time)
+            records = await self._dmpaft_cmd(self._archive_time)
             if records is not None:
                 break
             time.sleep(1)
@@ -660,24 +684,25 @@ class VantagePro(Station):
         fields['YearUtc'] = now[0]
         fields['MonthUtc'] = str(now[1]).zfill(2)
 
-    def parse(self):
+    async def parse(self):
         """
         read and parse a set of data read from the console.  after the
         data is parsed it is available in the fields variable.
         """
-        fields = self._get_loop_fields()
+        fields = await self._get_loop_fields()
         # TODO: this will overwrite the last archived record with the newest record.
         # Is this the expected behavior?
-        fields['Archive'] = self._get_new_archive_fields()
+        if self.want_archives:
+            fields['Archive'] = await self._get_new_archive_fields()
 
         self._calc_derived_fields(fields)
 
         # set the fields variable the values in the dict
         self.fields = fields
 
-    def get_reading(self) -> WeatherPoint:
+    async def get_reading(self) -> WeatherPoint:
         """Return a single weather reading."""
-        self.parse()
+        await self.parse()
 
         return self._fields_to_weather_point(self.fields)
 
